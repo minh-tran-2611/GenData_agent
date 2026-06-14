@@ -83,18 +83,20 @@ def _call_gemini_vertex(llm: dict, system: str, user: str, max_tokens: int, temp
 
     sa_path = llm.get("service_account_path")
     project_id = llm.get("project_id")
-    if not sa_path or not project_id:
-        raise RuntimeError("Gemini (Vertex) service account / project_id is not configured.")
-    creds = service_account.Credentials.from_service_account_file(
-        sa_path,
-        scopes=["https://www.googleapis.com/auth/cloud-platform"],
-    )
-    client = genai.Client(
-        vertexai=True,
-        project=project_id,
-        location=llm.get("location") or DEFAULT_VERTEX_LOCATION,
-        credentials=creds,
-    )
+    if not project_id:
+        raise RuntimeError("Gemini (Vertex) project_id is not configured.")
+    client_kwargs = {
+        "vertexai": True,
+        "project": project_id,
+        "location": llm.get("location") or DEFAULT_VERTEX_LOCATION,
+    }
+    # Có file key -> dùng nó; không có -> ADC (gcloud auth application-default login).
+    if sa_path:
+        client_kwargs["credentials"] = service_account.Credentials.from_service_account_file(
+            sa_path,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+    client = genai.Client(**client_kwargs)
     resp = client.models.generate_content(
         model=llm.get("model") or DEFAULT_GEMINI_MODEL,
         contents=user,
@@ -102,8 +104,20 @@ def _call_gemini_vertex(llm: dict, system: str, user: str, max_tokens: int, temp
             system_instruction=system,
             max_output_tokens=max_tokens,
             temperature=temperature,
+            # Force clean JSON (no ```json fences) — less prose, lower truncation risk.
+            response_mime_type="application/json",
+            # Keep thinking ON for better contextual plans, but cap it so it can't
+            # eat the whole output budget and leave the JSON truncated.
+            thinking_config=types.ThinkingConfig(thinking_budget=2048),
         ),
     )
+    # Detect the budget-exhausted case explicitly so the failure is legible
+    # instead of surfacing later as a confusing "Cannot parse JSON" error.
+    cand = (resp.candidates or [None])[0]
+    if cand and str(getattr(cand, "finish_reason", "")).endswith("MAX_TOKENS"):
+        raise RuntimeError(
+            "Gemini output bị cắt do hết token (tăng max_output_tokens hoặc giảm thinking_budget)."
+        )
     return (resp.text or "").strip()
 
 

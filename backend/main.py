@@ -36,10 +36,10 @@ app.add_middleware(
 SA_FILE = DATA_DIR / "vertex_sa.json"
 
 # ── Hard-coded LLM: the app always uses Gemini (Vertex AI) ──────────────────
-# Matches the AiAgent-service Vertex setup (same GCP project). The private key
-# lives in backend/vertex-sa.json (gitignored) — only the path/ids are in source.
+# Auth qua ADC (gcloud auth application-default login) — KHÔNG cần file JSON key
+# (org chặn tạo SA key). Nếu vẫn có file vertex-sa.json thì code dùng nó (tương thích cũ).
 VERTEX_SA_PATH = str(Path(__file__).parent / "vertex-sa.json")
-VERTEX_PROJECT_ID = "smiling-foundry-477815-s7"
+VERTEX_PROJECT_ID = "project-b4b13663-816a-47bd-98c"
 VERTEX_LOCATION = "us-central1"
 VERTEX_MODEL = "gemini-2.5-flash"
 
@@ -68,11 +68,7 @@ def _llm_config(memory: Memory) -> dict:
         sa_path = cfg.get("service_account_path")
         if not sa_path or not Path(sa_path).exists():
             sa_path = _bundled_vertex_sa()
-        if not sa_path:
-            raise HTTPException(
-                400,
-                f"Không tìm thấy service account Vertex AI. Đặt file tại {VERTEX_SA_PATH} hoặc dán JSON trong Settings.",
-            )
+        # sa_path có thể là None -> dùng ADC (gcloud auth application-default login).
         return {
             "provider": "gemini_vertex",
             "service_account_path": sa_path,
@@ -157,8 +153,9 @@ def get_settings():
     return {
         "provider": s.get("provider") or "gemini_vertex",
         "gemini_vertex": {
-            # Bundled service account means Vertex works with no UI upload.
-            "configured": bundled or bool(gv.get("service_account_path") and gv.get("project_id")),
+            # Auth qua ADC (gcloud auth application-default login) hoặc file SA gắn sẵn.
+            # Luôn có project_id mặc định -> coi như đã cấu hình; không cần upload JSON.
+            "configured": True,
             "bundled": bundled,
             "project_id": gv.get("project_id") or VERTEX_PROJECT_ID,
             "location": gv.get("location") or VERTEX_LOCATION,

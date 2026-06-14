@@ -136,7 +136,7 @@ Hãy quyết định cho CẢ KỲ {period_days} ngày này: tổng bao nhiêu u
         llm=llm,
         system=SEGMENT_SYSTEM,
         user=user_prompt,
-        max_tokens=8000 if period_days > 1 else 4000,
+        max_tokens=16000 if period_days > 1 else 8000,
         temperature=0.85,
     )
 

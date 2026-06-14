@@ -1,10 +1,10 @@
 import sys
-from google.oauth2 import service_account
+import google.auth
 from anthropic import AnthropicVertex
 
-SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
-creds = service_account.Credentials.from_service_account_file("vertex-sa.json", scopes=SCOPES)
-PROJECT = "smiling-foundry-477815-s7"
+# ADC: chạy `gcloud auth application-default login` trước (không cần JSON key).
+creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+PROJECT = "project-b4b13663-816a-47bd-98c"
 
 regions = ["us-east5", "us-central1", "europe-west1", "asia-southeast1", "global"]
 models = [

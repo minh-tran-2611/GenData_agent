@@ -141,8 +141,9 @@ export default function SettingsTab() {
                 Các ô dưới chỉ để <b>ghi đè</b> nếu muốn dùng project/model khác.
               </p>
             ) : (
-              <p className="text-xs text-amber-400/80">
-                Chưa thấy <code>backend/vertex-sa.json</code>. Dán nội dung service account JSON bên dưới hoặc đặt file vào đúng chỗ.
+              <p className="text-xs text-emerald-400/80">
+                Đang dùng <b>ADC</b> — chạy <code>gcloud auth application-default login</code> một lần là Vertex chạy được, <b>không cần</b> dán JSON.
+                Ô JSON bên dưới chỉ để ghi đè nếu muốn dùng service account khác.
               </p>
             )}
             <label className="block text-xs text-slate-400">Service account JSON (tuỳ chọn — dán nếu muốn dùng SA khác)</label>

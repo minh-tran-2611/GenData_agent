@@ -46,6 +46,54 @@ _PROVINCE = "TP. Hồ Chí Minh"
 _HOUR_WEIGHTS = {7: 1, 8: 2, 9: 2, 10: 3, 11: 7, 12: 10, 13: 8, 14: 3, 15: 2,
                  16: 3, 17: 5, 18: 9, 19: 10, 20: 8, 21: 5, 22: 2}
 
+# Đặt bàn (place_table): phần lớn hoàn tất, ít bị huỷ/chờ. Khớp EPlaceTableStatus.
+_BOOKING_STATUS = ["COMPLETED", "CONFIRMED", "PENDING", "DENIED"]
+_BOOKING_STATUS_W = [70, 18, 7, 5]
+_BOOKING_NOTES = [None, None, None, "Gần cửa sổ", "Khu yên tĩnh", "Có trẻ em",
+                  "Tiệc sinh nhật", "Bàn riêng tư", "Kỷ niệm"]
+_MEMBER_POOL = [2, 2, 2, 4, 4, 4, 5, 6, 8]
+
+# Nội dung review theo số sao (review thật lệch về tích cực). Dùng cho bảng reviews.
+_REVIEW_CONTENT = {
+    5: ["Món ăn rất ngon, sẽ quay lại!", "Tuyệt vời, đúng vị, phục vụ nhanh.",
+        "Chất lượng xuất sắc, đáng tiền.", "Ngon, trình bày đẹp, rất hài lòng.",
+        "Best seller đúng nghĩa, 10 điểm."],
+    4: ["Ngon, sẽ ủng hộ tiếp.", "Khá ổn, giao hàng nhanh.", "Hợp khẩu vị, giá hợp lý.",
+        "Tốt, chỉ hơi ít topping."],
+    3: ["Tạm ổn, không có gì đặc biệt.", "Bình thường, đủ ăn.",
+        "Ổn nhưng hơi nguội khi nhận.", "Trung bình, có thể cải thiện."],
+    2: ["Hơi nhạt, chưa hài lòng.", "Giao hơi lâu, món nguội.",
+        "Không như kỳ vọng.", "Phần ăn hơi ít so với giá."],
+    1: ["Thất vọng, sẽ không đặt lại.", "Món không ngon, đóng gói tệ.",
+        "Chất lượng kém.", "Rất tệ."],
+}
+_REVIEW_RATES = [5, 4, 3, 2, 1]
+_REVIEW_RATE_W = [50, 30, 12, 5, 3]
+
+
+def _pick_order_outcome(payment_method: str, dine_in: bool = False) -> dict:
+    """Chọn (trạng thái đơn, trạng thái payment, có tính doanh thu) sát thực tế.
+
+    Phần lớn COMPLETED/PAID; có 1 tỉ lệ huỷ (FAIL = huỷ trước trả, REFUND = đã trả rồi hoàn)
+    và vài đơn đang dang dở (PENDING / WAITING_FOR_PAYMENT). COD không có 'chờ thanh toán online'.
+    """
+    if dine_in:
+        status = random.choices(["COMPLETED", "CANCELED", "PENDING"], weights=[93, 5, 2], k=1)[0]
+    else:
+        status = random.choices(
+            ["COMPLETED", "CANCELED", "PENDING", "WAITING_FOR_PAYMENT"],
+            weights=[84, 10, 4, 2], k=1)[0]
+    if status == "WAITING_FOR_PAYMENT" and payment_method != "MOMO":
+        status = "PENDING"
+    if status == "COMPLETED":
+        return {"order_status": "COMPLETED", "payment_status": "PAID", "revenue": True}
+    if status == "CANCELED":
+        pay = random.choices(["FAIL", "REFUND"], weights=[55, 45], k=1)[0]
+        return {"order_status": "CANCELED", "payment_status": pay, "revenue": False}
+    if status == "WAITING_FOR_PAYMENT":
+        return {"order_status": "WAITING_FOR_PAYMENT", "payment_status": "PROCESSING", "revenue": False}
+    return {"order_status": "PENDING", "payment_status": "PROCESSING", "revenue": False}
+
 
 def _random_person() -> tuple[str, str]:
     """Return (full_name, gender) — a plausible Vietnamese name with matching gender."""
@@ -151,6 +199,8 @@ class SqlSink:
         self.start_date = _parse_date(config.get("start_date"))
         self.vat_rate = float(config.get("vat_rate") or 0.0)
         self.shipping_fee = float(config.get("shipping_fee") or 0.0)
+        # Tỉ lệ món (của đơn thành công) được khách đánh giá -> sinh review + rating.
+        self.review_rate = float(config.get("review_rate", 0.35))
         self.addr = {**DEFAULT_ADDRESS, **(config.get("address") or {})}
         self._fixed_addr = bool(config.get("address"))  # honor an explicit address override
         self._buf: list[str] = []
@@ -229,7 +279,7 @@ class SqlSink:
         gender = gender if gender in ("MALE", "FEMALE", "OTHER") else gen_gender
         # Cache the profile so this customer's orders reuse the same identity/address.
         self._profiles[uid] = {
-            "name": full_name, "phone": phone,
+            "name": full_name, "phone": phone, "email": email,
             "addr": self.addr if self._fixed_addr else _random_address(),
             "created": created,
         }
@@ -313,11 +363,14 @@ class SqlSink:
         vat = round(subtotal * self.vat_rate, 2) if self.vat_rate else 0.0
         total = max(subtotal - discount, 0.0) + shipping + vat
 
+        # Trạng thái đơn + payment sát thực tế (đa số COMPLETED, vài huỷ/dang dở).
+        outcome = _pick_order_outcome(payment_method)
         pay_id = self._next("payments")
         self._buf.append(
             "INSERT INTO `payments` (`id`,`amount`,`payment_date`,`payment_info`,`payment_message`,"
             "`payment_method`,`status`) VALUES "
-            f"({pay_id},{_n(total)},{_dt(created)},NULL,'Simulated payment',{_s(payment_method)},'PAID');"
+            f"({pay_id},{_n(total)},{_dt(created)},NULL,'Simulated payment',{_s(payment_method)},"
+            f"{_s(outcome['payment_status'])});"
         )
 
         order_id = self._next("orders")
@@ -329,14 +382,15 @@ class SqlSink:
             "`updated_at`,`vat`,`payment_id`,`user_id`,`voucher_id`) VALUES "
             f"({order_id},{_dt(created)},{_n(discount)},{_s(a['address'])},{_s(a['district'])},b'0',"
             f"{_s(a['province'])},{_s(prof['name'])},{_s(prof['phone'])},{_s(a['ward'])},{_n(shipping)},"
-            f"'COMPLETED',{_n(total)},{_dt(created)},{_n(vat)},{pay_id},{user_id},"
+            f"{_s(outcome['order_status'])},{_n(total)},{_dt(created)},{_n(vat)},{pay_id},{user_id},"
             f"{_n(voucher_id) if voucher_id else 'NULL'});"
         )
 
-        # Keep users.total_spent consistent so analytics/reports see realistic lifetime spend.
-        self._buf.append(
-            f"UPDATE `users` SET `total_spent`=COALESCE(`total_spent`,0)+{_n(total)} WHERE `id`={user_id};"
-        )
+        # Chỉ cộng total_spent khi đơn thực sự thành công (COMPLETED + PAID).
+        if outcome["revenue"]:
+            self._buf.append(
+                f"UPDATE `users` SET `total_spent`=COALESCE(`total_spent`,0)+{_n(total)} WHERE `id`={user_id};"
+            )
 
         for it in items:
             item_id = self._next("order_items")
@@ -344,16 +398,23 @@ class SqlSink:
             product_id = it.get("product_id")
             combo_sql = str(int(combo_id)) if combo_id else "NULL"
             product_sql = str(int(product_id)) if product_id else "NULL"
+            # Một phần món của đơn thành công được khách đánh giá (review thật + rating).
+            do_review = bool(outcome["revenue"] and product_id and random.random() < self.review_rate)
+            reviewed_bit = "b'1'" if do_review else "b'0'"
             self._buf.append(
                 "INSERT INTO `order_items` (`id`,`created_at`,`note`,`price`,`quantity`,`reviewed`,"
                 "`updated_at`,`combo_id`,`order_id`,`order_at_table_id`,`place_table_id`,`product_id`) VALUES "
-                f"({item_id},{_dt(created)},NULL,{_n(it['price'])},{int(it['quantity'])},b'0',"
+                f"({item_id},{_dt(created)},NULL,{_n(it['price'])},{int(it['quantity'])},{reviewed_bit},"
                 f"{_dt(created)},{combo_sql},{order_id},NULL,NULL,{product_sql});"
             )
+            if do_review:
+                self._emit_review(order_item_id=item_id, product_id=int(product_id),
+                                  user_id=user_id, base_dt=created)
 
         # Record voucher usage when a voucher was actually applied (free-ship counts
         # even though order discount_amount is 0 — the saving is the shipping fee).
-        if voucher_id and (discount > 0 or free_ship):
+        # Chỉ tính lượt dùng voucher cho đơn thành công (đơn huỷ -> voucher hoàn lại).
+        if outcome["revenue"] and voucher_id and (discount > 0 or free_ship):
             vu_discount = self.shipping_fee if free_ship else discount
             vu_id = self._next("voucher_usages")
             self._buf.append(
@@ -372,3 +433,146 @@ class SqlSink:
             "total": round(total, 2),
             "num_items": len(items),
         }
+
+    # ---- shared emitters (payment + order items) -----------------------------
+    def _emit_payment(self, total: float, created: datetime, method: str = "COD",
+                      status: str = "PAID") -> int:
+        """Emit a payment row; returns its id. EPaymentMethod chỉ có COD/MOMO."""
+        if method not in ("COD", "MOMO"):
+            method = "COD"
+        pay_id = self._next("payments")
+        self._buf.append(
+            "INSERT INTO `payments` (`id`,`amount`,`payment_date`,`payment_info`,`payment_message`,"
+            "`payment_method`,`status`) VALUES "
+            f"({pay_id},{_n(total)},{_dt(created)},NULL,'Simulated payment',{_s(method)},{_s(status)});"
+        )
+        return pay_id
+
+    def _emit_review(self, *, order_item_id: int, product_id: int, user_id: int,
+                     base_dt: datetime) -> int:
+        """Emit a review row (rating lệch tích cực) cho 1 order_item đã hoàn tất."""
+        rate = random.choices(_REVIEW_RATES, weights=_REVIEW_RATE_W, k=1)[0]
+        content = random.choice(_REVIEW_CONTENT[rate])
+        # Khách thường đánh giá sau khi nhận hàng vài giờ → vài ngày.
+        created = base_dt + timedelta(days=random.randint(0, 4), hours=random.randint(1, 12))
+        rid = self._next("reviews")
+        self._buf.append(
+            "INSERT INTO `reviews` (`id`,`content`,`created_at`,`rate`,`updated_at`,"
+            "`order_item_id`,`product_id`,`user_id`) VALUES "
+            f"({rid},{_s(content)},{_dt(created)},{rate},{_dt(created)},"
+            f"{int(order_item_id)},{int(product_id)},{int(user_id)});"
+        )
+        return rid
+
+    def _emit_order_items(self, items: list[dict], created: datetime, *,
+                          order_id: Optional[int] = None,
+                          order_at_table_id: Optional[int] = None,
+                          place_table_id: Optional[int] = None) -> None:
+        """Emit order_items rows linked to exactly one parent (order / order-at-table / booking)."""
+        for it in items:
+            item_id = self._next("order_items")
+            combo_id = it.get("combo_id")
+            product_id = it.get("product_id")
+            combo_sql = str(int(combo_id)) if combo_id else "NULL"
+            product_sql = str(int(product_id)) if product_id else "NULL"
+            self._buf.append(
+                "INSERT INTO `order_items` (`id`,`created_at`,`note`,`price`,`quantity`,`reviewed`,"
+                "`updated_at`,`combo_id`,`order_id`,`order_at_table_id`,`place_table_id`,`product_id`) VALUES "
+                f"({item_id},{_dt(created)},NULL,{_n(it['price'])},{int(it['quantity'])},b'0',"
+                f"{_dt(created)},{combo_sql},{order_id if order_id else 'NULL'},"
+                f"{order_at_table_id if order_at_table_id else 'NULL'},"
+                f"{place_table_id if place_table_id else 'NULL'},{product_sql});"
+            )
+
+    def _booking_times(self) -> tuple[datetime, datetime]:
+        """(created, started): đặt lúc created, giờ ngồi started muộn hơn, cùng ngày, cap 22:30."""
+        created = self._ts()
+        day_end = datetime(self._cur_date.year, self._cur_date.month, self._cur_date.day, 22, 30, 0)
+        started = min(created + timedelta(hours=random.randint(0, 4), minutes=random.choice([0, 30])), day_end)
+        return created, started
+
+    # ---- tables (seed once) --------------------------------------------------
+    def ensure_tables(self, count: int = 15) -> list[int]:
+        """Seed các bàn vật lý 1 lần duy nhất (idempotent qua state). Trả về list id bàn."""
+        ids = self.state.get("table_ids")
+        if ids:
+            return ids
+        ids, seats = [], []
+        seats_pool = [2, 2, 4, 4, 4, 6, 8]
+        created = datetime(self.start_date.year, self.start_date.month, self.start_date.day, 8, 0, 0)
+        for i in range(1, int(count) + 1):
+            tid = self._next("tables")
+            seat = random.choice(seats_pool)
+            self._buf.append(
+                "INSERT INTO `tables` (`id`,`created_at`,`qr`,`seat`,`table_number`,`updated_at`) VALUES "
+                f"({tid},{_dt(created)},NULL,{seat},{_s(f'Bàn {i}')},{_dt(created)});"
+            )
+            ids.append(tid)
+            seats.append(seat)
+        self.state["table_ids"] = ids
+        self.state["table_seats"] = seats
+        return ids
+
+    # ---- đặt bàn khách vãng lai ----------------------------------------------
+    def add_guest_booking(self, status: Optional[str] = None) -> int:
+        """place_table_guests: khách lẻ không tài khoản, CHỈ là yêu cầu giữ chỗ (không hoá đơn).
+
+        status do simulator quyết theo sức chứa (DENIED khi hết chỗ); None = tự random.
+        """
+        name, _ = _random_person()
+        phone = "0" + random.choice(_PHONE_PREFIXES) + f"{random.randint(0, 9_999_999):07d}"
+        seq = self.state.get("guest_seq", 0) + 1
+        self.state["guest_seq"] = seq
+        email = f"guest_{seq}@example.com" if random.random() < 0.6 else None
+        created, started = self._booking_times()
+        status = status or random.choices(_BOOKING_STATUS, weights=_BOOKING_STATUS_W, k=1)[0]
+        bid = self._next("place_table_guests")
+        self._buf.append(
+            "INSERT INTO `place_table_guests` (`id`,`created_at`,`email`,`fullname`,`member_int`,`note`,"
+            "`phone_number`,`started_at`,`status`,`updated_at`) VALUES "
+            f"({bid},{_dt(created)},{_s(email)},{_s(name)},{random.choice(_MEMBER_POOL)},"
+            f"{_s(random.choice(_BOOKING_NOTES))},{_s(phone)},{_dt(started)},{_s(status)},{_dt(started)});"
+        )
+        return bid
+
+    # ---- đặt bàn khách quen (có tài khoản, có thể gọi món trước) --------------
+    def add_customer_booking(self, user_id: int, status: Optional[str] = None) -> int:
+        """place_table_customers: khách quen (đã đăng nhập) gửi YÊU CẦU đặt bàn.
+
+        Chỉ là bản ghi giữ chỗ — KHÔNG mang hoá đơn. Doanh thu dine-in (ăn tại bàn) hệ thống
+        thật không quy được về khách quen (order_at_table ẩn danh), nên total_price/payment để
+        NULL và KHÔNG cộng total_spent. status do simulator quyết theo sức chứa.
+        """
+        prof = self._profile_for(user_id)
+        email = prof.get("email") or f"sim_user_{user_id}@example.com"
+        created, started = self._booking_times()
+        status = status or random.choices(_BOOKING_STATUS, weights=_BOOKING_STATUS_W, k=1)[0]
+        bid = self._next("place_table_customers")
+        self._buf.append(
+            "INSERT INTO `place_table_customers` (`id`,`created_at`,`email`,`member`,`note`,`phone_number`,"
+            "`started_at`,`status`,`total_price`,`updated_at`,`payment_id`,`user_id`) VALUES "
+            f"({bid},{_dt(created)},{_s(email)},{random.choice(_MEMBER_POOL)},"
+            f"{_s(random.choice(_BOOKING_NOTES))},{_s(prof['phone'])},{_dt(started)},{_s(status)},"
+            f"NULL,{_dt(started)},NULL,{user_id});"
+        )
+        return bid
+
+    # ---- order tại bàn (dine-in) ---------------------------------------------
+    def add_order_at_table(self, table_id: int, items: list[dict],
+                           payment_method: str = "COD") -> dict:
+        """order_at_table: khách ngồi tại bàn gọi món (không phí ship). items đã resolve giá."""
+        created = self._ts()
+        subtotal = sum(float(it["price"]) * int(it["quantity"]) for it in items)
+        vat = round(subtotal * self.vat_rate, 2) if self.vat_rate else 0.0
+        total = round(subtotal + vat, 2)
+        outcome = _pick_order_outcome(payment_method, dine_in=True)
+        pay_id = self._emit_payment(total, created, payment_method, status=outcome["payment_status"])
+        oid = self._next("order_at_table")
+        self._buf.append(
+            "INSERT INTO `order_at_table` (`id`,`created_at`,`table_id`,`status`,`total_price`,"
+            "`updated_at`,`payment_id`) VALUES "
+            f"({oid},{_dt(created)},{int(table_id)},{_s(outcome['order_status'])},{_n(total)},"
+            f"{_dt(created)},{pay_id});"
+        )
+        self._emit_order_items(items, created, order_at_table_id=oid)
+        return {"order_at_table_id": oid, "total": round(total, 2), "num_items": len(items)}

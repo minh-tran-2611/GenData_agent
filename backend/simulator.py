@@ -472,6 +472,104 @@ def _apply_segment_day_stats(segment: SegmentState, stats: dict[str, Any], plan:
     )
 
 
+def _random_menu_items(snapshot: dict, n: int) -> list[dict]:
+    """Chọn ngẫu nhiên n món có sẵn từ snapshot làm dòng order (cho dine-in / đặt bàn có gọi món)."""
+    pool: list[tuple[int, float]] = []
+    for p in _iter_products(snapshot):
+        if str(p.get("status") or "").upper() in _UNAVAILABLE_STATUS:
+            continue
+        price = _price_of(p, _PRODUCT_PRICE_KEYS)
+        pid = p.get("id") or p.get("productId")
+        if price > 0 and pid is not None:
+            pool.append((int(pid), price))
+    if not pool:
+        return []
+    items: list[dict] = []
+    for _ in range(max(1, n)):
+        pid, price = random.choice(pool)
+        items.append({"product_id": pid, "quantity": random.randint(1, 3), "price": price})
+    return items
+
+
+def _table_cfg(memory: Memory) -> dict:
+    """Cấu hình số bàn + sức chứa + tỉ lệ hoạt động tại bàn (đọc từ settings.sql, có default)."""
+    sql = (memory.settings or {}).get("sql") or {}
+    return {
+        "table_count": int(sql.get("table_count") or 15),
+        "turnover_per_table": float(sql.get("turnover_per_table", 4)),  # số lượt quay vòng/bàn/ngày
+        "dine_in_ratio": float(sql.get("dine_in_ratio", 0.5)),
+        "guest_booking_ratio": float(sql.get("guest_booking_ratio", 0.25)),
+        "customer_booking_ratio": float(sql.get("customer_booking_ratio", 0.15)),
+        "reservable_fraction": float(sql.get("reservable_fraction", 0.6)),  # % sức chứa nhận đặt trước
+        "no_show_rate": float(sql.get("no_show_rate", 0.12)),               # % đặt bàn nhận nhưng không đến
+    }
+
+
+def _generate_table_activity(memory: Memory, sink: SqlSink, day_orders: int) -> dict:
+    """Sinh hoạt động tại quán cho 1 ngày (chỉ chế độ SQL), TÔN TRỌNG sức chứa thật.
+
+    - order_at_table: lượt quét QR gọi món tại bàn — ẩn danh, là doanh thu dine-in. Cap theo
+      số bàn * lượt quay vòng, không bàn nào vượt turnover.
+    - đặt bàn (place_table_*): chỉ là YÊU CẦU giữ chỗ, ĐỘC LẬP với order_at_table (hệ thống thật
+      không link được). Quá ngưỡng nhận đặt -> DENIED (hết chỗ); một phần CONFIRMED = no-show.
+    """
+    cfg = _table_cfg(memory)
+    table_ids = sink.ensure_tables(cfg["table_count"])
+    snapshot = memory.snapshot
+    pool = memory.sql_sink.get("user_ids") or []
+
+    def _count(ratio: float) -> int:
+        return max(0, int(round(day_orders * ratio + random.uniform(-0.5, 0.8))))
+
+    cap = max(1, int(round(len(table_ids) * cfg["turnover_per_table"])))
+
+    # ---- order tại bàn (QR, ẩn danh): cap sức chứa, mỗi bàn tối đa `turnover` lượt ----
+    n_dine = min(_count(cfg["dine_in_ratio"]), cap)
+    turns = max(1, int(round(cfg["turnover_per_table"])))
+    seat_pool: list = []
+    for tid in table_ids:
+        seat_pool.extend([tid] * turns)
+    random.shuffle(seat_pool)
+    dine = 0
+    for tid in seat_pool[:n_dine]:
+        items = _random_menu_items(snapshot, random.randint(1, 4))
+        if not items:
+            continue
+        sink.add_order_at_table(tid, items, payment_method="MOMO" if random.random() < 0.2 else "COD")
+        dine += 1
+
+    # ---- đặt bàn (yêu cầu giữ chỗ): trạng thái theo sức chứa ----
+    n_req = _count(cfg["guest_booking_ratio"] + cfg["customer_booking_ratio"])
+    reservable = max(1, int(round(cap * cfg["reservable_fraction"])))
+    gr, cr = cfg["guest_booking_ratio"], cfg["customer_booking_ratio"]
+    cust_share = cr / (gr + cr) if (gr + cr) > 0 else 0.0
+    denied = no_show = completed = guests = custs = 0
+    for i in range(n_req):
+        if i >= reservable:
+            status = "DENIED"                      # hết chỗ -> nhà hàng từ chối
+        elif random.random() < 0.03:
+            status = "PENDING"                     # mới gửi, chưa xử lý
+        elif random.random() < cfg["no_show_rate"]:
+            status = "CONFIRMED"                    # nhận nhưng khách KHÔNG đến (no-show)
+        else:
+            status = "COMPLETED"                   # khách đã đến
+        if pool and random.random() < cust_share:
+            sink.add_customer_booking(random.choice(pool), status=status)
+            custs += 1
+        else:
+            sink.add_guest_booking(status=status)
+            guests += 1
+        if status == "DENIED":
+            denied += 1
+        elif status == "COMPLETED":
+            completed += 1
+        elif status == "CONFIRMED":
+            no_show += 1
+
+    return {"dine_in": dine, "bookings": n_req, "denied": denied,
+            "no_show": no_show, "completed": completed, "guests": guests, "customers": custs}
+
+
 def _simulate_period(
     memory: Memory,
     llm: dict,
@@ -524,13 +622,24 @@ def _simulate_period(
         append_log(memory, entry)
         new_logs.append(entry)
 
+        day_orders = 0
         for segment in sim.segments:
             plan = plans.get(segment.id, {"actions": []})
             day_actions = _actions_for_day(plan, d)
             stats = _run_segment_actions(memory, segment, day_actions, day, sink, new_logs)
+            day_orders += stats.get("orders", 0)
             _apply_segment_day_stats(segment, stats, plan)
 
         if sink is not None:
+            ta = _generate_table_activity(memory, sink, day_orders)
+            entry = RunLogEntry(
+                timestamp=now_iso(), day=day, action="table_activity", status="ok",
+                detail=(f"Tại quán: {ta['dine_in']} order QR tại bàn; "
+                        f"đặt bàn {ta['bookings']} yêu cầu "
+                        f"({ta['completed']} đến, {ta['no_show']} no-show, {ta['denied']} từ chối)"),
+            )
+            append_log(memory, entry)
+            new_logs.append(entry)
             sink.end_day()
         entry = RunLogEntry(
             timestamp=now_iso(), day=day, action="day_end", status="info",
